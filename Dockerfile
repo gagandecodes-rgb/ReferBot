@@ -5,7 +5,6 @@ RUN apt-get update \
  && docker-php-ext-install pdo pdo_pgsql \
  && rm -rf /var/lib/apt/lists/*
 
-# Copy all your PHP files to Apache web root
 COPY index.php /var/www/html/index.php
 COPY verify.php /var/www/html/verify.php
 COPY verify_api.php /var/www/html/verify_api.php
