@@ -1,20 +1,36 @@
 <?php
 // =====================================================
-// FAST index.php (Telegram Webhook Bot) + Supabase Postgres
+// index.php (Telegram Webhook Bot) + Supabase Postgres
 // Web verify files: verify.php + verify_api.php
 //
-// /start -> join channels msg + ✅ Verify (only)
-// ✅ Verify -> check channels -> send web verify buttons
-// ✅ Check Verification -> if verified => show full menu (no verify button)
+// Flow:
+// /start -> join channels msg + ✅ Verify (reply keyboard)
+// ✅ Verify -> check channels -> send web verify buttons (inline)
+// ✅ Check Verification -> if verified => show full menu (NO verify button)
 //
-// ADMIN BUTTONS:
-// ➕ Add Coupons (type -> paste codes)
-// ➖ Remove Coupons (type -> paste codes)
-// 📦 Stock
-// 📜 Withdrawals Log
-// 👥 Users Stats
-// 📣 Broadcast
-// ⚙️ Set Redeem Cost (points)
+// FAST + Stockout safe:
+// - Redeem checks stock first in txn + FOR UPDATE SKIP LOCKED
+// - If stock out => NO points cut
+//
+// Admin panel (mm.py style buttons):
+// - Add Coupons (500/1000/2000/4000)
+// - Set Rate (points cost) per type
+// - Add Points (user / all)
+// - Set Referral Reward
+// - Broadcast
+// - Coupon Stats
+// - User List / Top Balances
+// - View Refs (by user)
+// - User Info (by user)
+// - Ban / Unban
+// - Channels (view env list only) + (optional add/remove stored in config)
+// - Tasks (placeholder)
+// - Withdraw Settings (toggle + daily limit)
+// - Referral Stats
+// - Export Data (CSV as document)
+// - Import Data (placeholder)
+// - View Point Requests (placeholder)
+// - Bot Status
 // =====================================================
 
 $BOT_TOKEN      = getenv("BOT_TOKEN");
@@ -37,7 +53,7 @@ foreach (explode(",", $ADMIN_IDS_RAW) as $x) {
   if (ctype_digit($x)) $ADMIN_IDS[(int)$x] = true;
 }
 
-// ---------- Required channels ----------
+// ---------- Required channels (default from env) ----------
 $CHANNELS_REQUIRED = [];
 foreach (explode(",", $FORCE_JOIN_RAW) as $c) {
   $c = trim($c);
@@ -47,8 +63,11 @@ if (count($CHANNELS_REQUIRED) === 0) {
   $CHANNELS_REQUIRED = ["@channel1","@channel2","@channel3","@channel4"];
 }
 
-// ---------- Default redeem cost (admin can change) ----------
+// ---------- Defaults ----------
 $DEFAULT_REDEEM_COST = ["500"=>3, "1000"=>10, "2000"=>20, "4000"=>40];
+$DEFAULT_REF_REWARD = 1;
+$DEFAULT_WITHDRAW_ON = true;
+$DEFAULT_DAILY_LIMIT = 999999;
 
 // ---------- DB ----------
 function db() {
@@ -91,7 +110,30 @@ function tg($method, $data) {
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_HTTPHEADER => ["Content-Type: application/json"],
     CURLOPT_POSTFIELDS => json_encode($data, JSON_UNESCAPED_UNICODE),
-    CURLOPT_TIMEOUT => 20
+    CURLOPT_TIMEOUT => 15
+  ]);
+  $res = curl_exec($ch);
+  curl_close($ch);
+  return $res ? json_decode($res, true) : null;
+}
+
+// sendDocument multipart (for export)
+function tg_send_document($chat_id, $file_path, $caption="") {
+  $token = $GLOBALS["BOT_TOKEN"];
+  $url = "https://api.telegram.org/bot{$token}/sendDocument";
+
+  $post = [
+    "chat_id" => $chat_id,
+    "caption" => $caption,
+    "document" => new CURLFile($file_path)
+  ];
+
+  $ch = curl_init($url);
+  curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POSTFIELDS => $post,
+    CURLOPT_TIMEOUT => 30
   ]);
   $res = curl_exec($ch);
   curl_close($ch);
@@ -133,9 +175,15 @@ function clear_admin_state($admin_id) {
   unset($s[(string)$admin_id]);
   state_save($s);
 }
+
 function get_config() {
   $s = state_load();
-  return $s["_config"] ?? ["redeem_cost"=>[]];
+  $cfg = $s["_config"] ?? [];
+  if (!isset($cfg["redeem_cost"])) $cfg["redeem_cost"] = [];
+  if (!isset($cfg["ref_reward"])) $cfg["ref_reward"] = $GLOBALS["DEFAULT_REF_REWARD"];
+  if (!isset($cfg["withdraw_on"])) $cfg["withdraw_on"] = $GLOBALS["DEFAULT_WITHDRAW_ON"];
+  if (!isset($cfg["daily_limit"])) $cfg["daily_limit"] = $GLOBALS["DEFAULT_DAILY_LIMIT"];
+  return $cfg;
 }
 function save_config($cfg) {
   $s = state_load();
@@ -148,6 +196,18 @@ function redeem_cost($ctype) {
   if (isset($rc[$ctype]) && is_numeric($rc[$ctype])) return (int)$rc[$ctype];
   return (int)($GLOBALS["DEFAULT_REDEEM_COST"][$ctype] ?? 999999);
 }
+function ref_reward() {
+  $cfg = get_config();
+  return (int)($cfg["ref_reward"] ?? $GLOBALS["DEFAULT_REF_REWARD"]);
+}
+function withdraw_on() {
+  $cfg = get_config();
+  return (bool)($cfg["withdraw_on"] ?? $GLOBALS["DEFAULT_WITHDRAW_ON"]);
+}
+function daily_limit() {
+  $cfg = get_config();
+  return (int)($cfg["daily_limit"] ?? $GLOBALS["DEFAULT_DAILY_LIMIT"]);
+}
 
 // ---------- Users ----------
 function ensure_user($tg_id, $username="", $first_name="") {
@@ -157,8 +217,8 @@ function ensure_user($tg_id, $username="", $first_name="") {
     values (:tg_id, :u, :f)
     on conflict (tg_id) do update set
       last_seen = now(),
-      username = case when public.users.username is null or public.users.username = '' then excluded.username else public.users.username end,
-      first_name = case when public.users.first_name is null or public.users.first_name = '' then excluded.first_name else public.users.first_name end
+      username = excluded.username,
+      first_name = excluded.first_name
     returning *
   ");
   $st->execute([":tg_id"=>$tg_id, ":u"=>$username, ":f"=>$first_name]);
@@ -172,7 +232,12 @@ function get_user($tg_id) {
   return $st->fetch(PDO::FETCH_ASSOC);
 }
 
-// ---------- Force Join (only on ✅ Verify) ----------
+function is_banned($tg_id) {
+  $u = get_user($tg_id);
+  return $u && ($u["banned"] ?? false);
+}
+
+// ---------- Force Join (ONLY on ✅ Verify) ----------
 function check_joined_all($tg_id) {
   $not = [];
   foreach ($GLOBALS["CHANNELS_REQUIRED"] as $ch) {
@@ -185,7 +250,7 @@ function check_joined_all($tg_id) {
   return $not;
 }
 
-// ---------- Stock (FAST: one query) ----------
+// ---------- Stock ----------
 function stock_all() {
   $pdo = db();
   $st = $pdo->query("
@@ -202,8 +267,26 @@ function stock_all() {
   return $out;
 }
 
-// ---------- Redeem (stock check first, no cut on stockout) ----------
+function used_counts() {
+  $pdo = db();
+  $st = $pdo->query("
+    select ctype, count(*)::int as c
+    from public.coupons
+    where is_used=true
+    group by ctype
+  ");
+  $out = ["500"=>0,"1000"=>0,"2000"=>0,"4000"=>0];
+  while ($r = $st->fetch(PDO::FETCH_ASSOC)) {
+    $t = (string)$r["ctype"];
+    $out[$t] = (int)$r["c"];
+  }
+  return $out;
+}
+
+// ---------- Redeem (stock check first, daily limit, no cut on stockout) ----------
 function redeem_coupon($tg_id, $ctype) {
+  if (!withdraw_on()) return ["ok"=>false,"msg"=>"Withdraw is OFF (admin disabled)"];
+
   $cost = redeem_cost($ctype);
   $pdo = db();
   $pdo->beginTransaction();
@@ -213,6 +296,16 @@ function redeem_coupon($tg_id, $ctype) {
     $user = $u->fetch(PDO::FETCH_ASSOC);
     if (!$user) { $pdo->rollBack(); return ["ok"=>false,"msg"=>"User not found"]; }
     if (!($user["verified"] ?? false)) { $pdo->rollBack(); return ["ok"=>false,"msg"=>"Verify first"]; }
+    if (($user["banned"] ?? false)) { $pdo->rollBack(); return ["ok"=>false,"msg"=>"You are banned"]; }
+
+    // daily limit
+    $limit = daily_limit();
+    if ($limit > 0 && $limit < 999999) {
+      $st = $pdo->prepare("select count(*) from public.withdrawals where tg_id=:id and created_at >= date_trunc('day', now())");
+      $st->execute([":id"=>$tg_id]);
+      $todayCount = (int)$st->fetchColumn();
+      if ($todayCount >= $limit) { $pdo->rollBack(); return ["ok"=>false,"msg"=>"Daily limit reached"]; }
+    }
 
     $points = (int)$user["points"];
     if ($points < $cost) { $pdo->rollBack(); return ["ok"=>false,"msg"=>"Not enough points"]; }
@@ -245,14 +338,13 @@ function redeem_coupon($tg_id, $ctype) {
   }
 }
 
-// ---------- Broadcast (still heavy, but fast loop) ----------
+// ---------- Broadcast ----------
 function broadcast_all($text) {
   $pdo = db();
   $st = $pdo->query("select tg_id from public.users");
   while ($row = $st->fetch(PDO::FETCH_ASSOC)) {
     tg("sendMessage", ["chat_id"=>(int)$row["tg_id"], "text"=>$text, "parse_mode"=>"HTML"]);
-    // keep small delay to avoid flood-limit
-    usleep(15000);
+    usleep(12000); // small delay (avoid flood)
   }
 }
 
@@ -278,6 +370,10 @@ function send_menu($chat_id, $user=null) {
   $verified = ($user && ($user["verified"] ?? false));
 
   if (!$verified) { send_join_message($chat_id); return; }
+  if (($user["banned"] ?? false)) {
+    tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🚫 You are banned."]);
+    return;
+  }
 
   $keyboard = [
     [["text"=>"🎟️ Coupons"], ["text"=>"📊 Stats"]],
@@ -320,34 +416,32 @@ function coupons_buttons() {
 }
 
 function admin_panel_buttons() {
+  // mm.py style callbacks (kept same-ish)
   return [
     "inline_keyboard"=>[
-      [
-        ["text"=>"➕ Add Coupons", "callback_data"=>"admin:add"],
-        ["text"=>"➖ Remove Coupon", "callback_data"=>"admin:remove"]
-      ],
-      [
-        ["text"=>"📦 Stock", "callback_data"=>"admin:stock"],
-        ["text"=>"📜 Withdrawals", "callback_data"=>"admin:logs"]
-      ],
-      [
-        ["text"=>"👥 Users Stats", "callback_data"=>"admin:users"],
-        ["text"=>"📣 Broadcast", "callback_data"=>"admin:broadcast"]
-      ],
-      [
-        ["text"=>"⚙️ Set Redeem Cost", "callback_data"=>"admin:setcost"]
-      ]
+      [["text"=>"➕ Add Coupons (₹500)", "callback_data"=>"admin_add_coupon:500"], ["text"=>"➕ Add Coupons (₹1000)", "callback_data"=>"admin_add_coupon:1000"]],
+      [["text"=>"➕ Add Coupons (₹2000)", "callback_data"=>"admin_add_coupon:2000"], ["text"=>"➕ Add Coupons (₹4000)", "callback_data"=>"admin_add_coupon:4000"]],
+
+      [["text"=>"💰 Set Rate (₹500)", "callback_data"=>"admin_set_rate:500"], ["text"=>"💰 Set Rate (₹1000)", "callback_data"=>"admin_set_rate:1000"]],
+      [["text"=>"💰 Set Rate (₹2000)", "callback_data"=>"admin_set_rate:2000"], ["text"=>"💰 Set Rate (₹4000)", "callback_data"=>"admin_set_rate:4000"]],
+
+      [["text"=>"⭐ Add Points (User)", "callback_data"=>"admin_add_points_user"], ["text"=>"🌟 Add Points (All)", "callback_data"=>"admin_add_points_all"]],
+      [["text"=>"🎉 Set Ref Reward", "callback_data"=>"admin_set_ref_reward"], ["text"=>"📣 Broadcast", "callback_data"=>"admin_broadcast"]],
+
+      [["text"=>"📦 Coupon Stats", "callback_data"=>"admin_coupon_stats"], ["text"=>"📋 User List", "callback_data"=>"admin_user_list"]],
+      [["text"=>"💎 Top Balances", "callback_data"=>"admin_top_balances"], ["text"=>"📈 View Refs", "callback_data"=>"admin_view_refs"]],
+      [["text"=>"📄 User Info", "callback_data"=>"admin_user_info"], ["text"=>"🚫 Ban", "callback_data"=>"admin_ban"]],
+      [["text"=>"🔑 Unban", "callback_data"=>"admin_unban"], ["text"=>"📣 Channels", "callback_data"=>"admin_channels"]],
+      [["text"=>"🧩 Tasks", "callback_data"=>"admin_tasks"], ["text"=>"⚙️ Withdraw Settings", "callback_data"=>"admin_withdraw_settings"]],
+      [["text"=>"📊 Referral Stats", "callback_data"=>"admin_ref_stats"], ["text"=>"📤 Export Data", "callback_data"=>"admin_export"]],
+      [["text"=>"📥 Import Data", "callback_data"=>"admin_import"], ["text"=>"📝 View Point Requests", "callback_data"=>"admin_view_requests"]],
+      [["text"=>"🤖 Bot Status", "callback_data"=>"admin_bot_status"]],
     ]
   ];
 }
 
-function type_buttons($prefix) {
-  return [
-    "inline_keyboard"=>[
-      [["text"=>"500", "callback_data"=>$prefix."500"], ["text"=>"1000", "callback_data"=>$prefix."1000"]],
-      [["text"=>"2000", "callback_data"=>$prefix."2000"], ["text"=>"4000", "callback_data"=>$prefix."4000"]],
-    ]
-  ];
+function back_admin_btn() {
+  return ["inline_keyboard"=>[[["text"=>"⬅️ Back", "callback_data"=>"admin_back"]]]];
 }
 
 // ---------- Health check ----------
@@ -368,19 +462,19 @@ if (isset($update["callback_query"])) {
   $username = $cq["from"]["username"] ?? "";
   $first_name = $cq["from"]["first_name"] ?? "";
 
-  $user = ensure_user($chat_id, $username, $first_name);
+  ensure_user($chat_id, $username, $first_name);
 
-  // Always make UI feel instant
+  // instant UI
   tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
 
-  // ✅ Check Verification
+  // Check verification
   if ($data === "check_verify") {
     $u = get_user($chat_id);
     if ($u && ($u["verified"] ?? false)) {
       tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Verified successfully!"]);
       send_menu($chat_id, $u);
     } else {
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Not verified yet. Please verify on website then tap Check Verification."]);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Not verified yet. Verify on website then tap Check Verification."]);
     }
     exit;
   }
@@ -411,72 +505,238 @@ if (isset($update["callback_query"])) {
     exit;
   }
 
-  // Admin Panel actions
-  if (is_admin($chat_id) && strpos($data, "admin:") === 0) {
-    if ($data === "admin:add") {
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"➕ Select type to ADD:", "reply_markup"=>type_buttons("admin:addtype:")]);
-      exit;
-    }
-    if ($data === "admin:remove") {
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"➖ Select type to REMOVE:", "reply_markup"=>type_buttons("admin:removetype:")]);
-      exit;
-    }
-    if ($data === "admin:stock") {
-      $s = stock_all();
-      $msg = "📦 <b>Stock</b>\n\n500: <b>{$s["500"]}</b>\n1000: <b>{$s["1000"]}</b>\n2000: <b>{$s["2000"]}</b>\n4000: <b>{$s["4000"]}</b>";
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msg, "parse_mode"=>"HTML"]);
-      exit;
-    }
-    if ($data === "admin:logs") {
-      $pdo = db();
-      $st = $pdo->query("select tg_id, ctype, code, created_at from public.withdrawals order by id desc limit 10");
-      $rows = $st->fetchAll(PDO::FETCH_ASSOC);
-      if (!$rows) { tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📜 No withdrawals yet."]); exit; }
+  // Admin Panel callbacks
+  if (is_admin($chat_id)) {
 
-      $msg = "📜 <b>Last 10 Withdrawals</b>\n\n";
-      foreach ($rows as $r) {
-        $msg .= "• ".$r["created_at"]." | ".$r["ctype"]." | ".$r["tg_id"]."\n";
-      }
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msg, "parse_mode"=>"HTML"]);
+    if ($data === "admin_back") {
+      $cfg = get_config();
+      $text =
+        "🛠 <b>Admin Menu</b>\n\n".
+        "₹500 Rate: <b>".redeem_cost("500")."</b> pts\n".
+        "₹1000 Rate: <b>".redeem_cost("1000")."</b> pts\n".
+        "₹2000 Rate: <b>".redeem_cost("2000")."</b> pts\n".
+        "₹4000 Rate: <b>".redeem_cost("4000")."</b> pts\n".
+        "Referral Reward: <b>".ref_reward()."</b> pt\n".
+        "Withdraw: <b>".(withdraw_on() ? "ON" : "OFF")."</b>\n".
+        "Daily Limit: <b>".daily_limit()."</b>\n";
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$text, "parse_mode"=>"HTML", "reply_markup"=>admin_panel_buttons()]);
       exit;
     }
-    if ($data === "admin:users") {
+
+    // Add coupons (choose type)
+    if (strpos($data, "admin_add_coupon:") === 0) {
+      $ctype = explode(":", $data, 2)[1];
+      set_admin_state($chat_id, "await_add_codes", ["ctype"=>$ctype]);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"➕ Send coupon codes for <b>{$ctype}</b> (1 per line).", "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    // Set rate per type
+    if (strpos($data, "admin_set_rate:") === 0) {
+      $ctype = explode(":", $data, 2)[1];
+      set_admin_state($chat_id, "await_set_cost_value", ["ctype"=>$ctype]);
+      $current = redeem_cost($ctype);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"💰 Current cost for {$ctype} is <b>{$current}</b> points.\nSend new points number (example: 3).", "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_add_points_user") {
+      set_admin_state($chat_id, "await_add_points_user", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"⭐ Send: <b>USER_ID POINTS</b>\nExample: <code>123456789 5</code>", "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_add_points_all") {
+      set_admin_state($chat_id, "await_add_points_all", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🌟 Send points number to add to ALL users.\nExample: <code>1</code>", "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_set_ref_reward") {
+      set_admin_state($chat_id, "await_set_ref_reward", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🎉 Current referral reward: <b>".ref_reward()."</b>\nSend new referral reward points (number).", "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_broadcast") {
+      set_admin_state($chat_id, "await_broadcast", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📣 Send broadcast message text now (goes to all users).", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_coupon_stats") {
+      $s = stock_all();
+      $used = used_counts();
+      $pdo = db();
+      $w = (int)$pdo->query("select count(*) from public.withdrawals")->fetchColumn();
+
+      $msg = "📦 <b>Coupon Stats</b>\n\n".
+        "Available:\n".
+        "• 500: <b>{$s["500"]}</b>\n".
+        "• 1000: <b>{$s["1000"]}</b>\n".
+        "• 2000: <b>{$s["2000"]}</b>\n".
+        "• 4000: <b>{$s["4000"]}</b>\n\n".
+        "Used:\n".
+        "• 500: <b>{$used["500"]}</b>\n".
+        "• 1000: <b>{$used["1000"]}</b>\n".
+        "• 2000: <b>{$used["2000"]}</b>\n".
+        "• 4000: <b>{$used["4000"]}</b>\n\n".
+        "Total Withdrawals: <b>{$w}</b>";
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msg, "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_user_list") {
+      $pdo = db();
+      $st = $pdo->query("select tg_id, username, points, refs, verified from public.users order by points desc nulls last limit 50");
+      $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+      if (!$rows) {
+        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"No users.", "reply_markup"=>back_admin_btn()]);
+        exit;
+      }
+      $txt = "📋 <b>User List (Top 50 by points)</b>\n\n";
+      foreach ($rows as $r) {
+        $txt .= $r["tg_id"]." @".($r["username"] ?: "NA")." | ".$r["points"]." pts | refs ".$r["refs"]." | ".(($r["verified"])? "✅":"❌")."\n";
+        if (strlen($txt) > 3500) { $txt .= "\n... truncated"; break; }
+      }
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_top_balances") {
+      $pdo = db();
+      $st = $pdo->query("select tg_id, username, points from public.users order by points desc nulls last limit 10");
+      $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+      $txt = "💎 <b>Top Balances</b>\n\n";
+      $i=1;
+      foreach ($rows as $r) {
+        $txt .= "{$i}. ".$r["tg_id"]." @".($r["username"] ?: "NA")." - <b>".$r["points"]."</b> pts\n";
+        $i++;
+      }
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_view_refs") {
+      set_admin_state($chat_id, "await_view_refs", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📈 Send user id to view refs list.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_user_info") {
+      set_admin_state($chat_id, "await_user_info", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📄 Send user id for full info.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_ban") {
+      set_admin_state($chat_id, "await_ban", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🚫 Send user id to ban.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_unban") {
+      set_admin_state($chat_id, "await_unban", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🔑 Send user id to unban.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_channels") {
+      $txt = "📣 <b>Required Channels (from env FORCE_JOIN_CHANNELS)</b>\n\n";
+      foreach ($GLOBALS["CHANNELS_REQUIRED"] as $ch) $txt .= "• {$ch}\n";
+      $txt .= "\n(Editing channels from bot is not enabled in this PHP version.)";
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_tasks") {
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🧩 Tasks: (placeholder)\nIf you want same tasks system as mm.py, tell me what exactly tasks should do in PHP.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_withdraw_settings") {
+      $cfg = get_config();
+      $txt = "⚙️ <b>Withdraw Settings</b>\n\n".
+        "Withdraw: <b>".(withdraw_on() ? "ON":"OFF")."</b>\n".
+        "Daily Limit: <b>".daily_limit()."</b>\n\n".
+        "Use buttons:";
+      $kb = [
+        "inline_keyboard"=>[
+          [["text" => (withdraw_on() ? "Turn OFF 🔴" : "Turn ON 🟢"), "callback_data"=>"admin_toggle_withdraw"]],
+          [["text" => "Set Daily Limit 📅", "callback_data"=>"admin_set_daily_limit"]],
+          [["text" => "⬅️ Back", "callback_data"=>"admin_back"]]
+        ]
+      ];
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML", "reply_markup"=>$kb]);
+      exit;
+    }
+
+    if ($data === "admin_toggle_withdraw") {
+      $cfg = get_config();
+      $cfg["withdraw_on"] = !withdraw_on();
+      save_config($cfg);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Withdraw is now: ".(withdraw_on() ? "ON":"OFF"), "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_set_daily_limit") {
+      set_admin_state($chat_id, "await_set_daily_limit", []);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📅 Send new daily limit number (example: 5). Use 999999 for unlimited.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_ref_stats") {
       $pdo = db();
       $total = (int)$pdo->query("select count(*) from public.users")->fetchColumn();
       $verified = (int)$pdo->query("select count(*) from public.users where verified=true")->fetchColumn();
-      $sumPoints = (int)$pdo->query("select coalesce(sum(points),0) from public.users")->fetchColumn();
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"👥 <b>Users Stats</b>\n\nUsers: <b>{$total}</b>\nVerified: <b>{$verified}</b>\nTotal Points: <b>{$sumPoints}</b>", "parse_mode"=>"HTML"]);
-      exit;
-    }
-    if ($data === "admin:broadcast") {
-      set_admin_state($chat_id, "await_broadcast", []);
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📣 Send broadcast message text now (it will go to all users)."]);
-      exit;
-    }
-    if ($data === "admin:setcost") {
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"⚙️ Select type to set points cost:", "reply_markup"=>type_buttons("admin:setcosttype:")]);
+      $refTotal = (int)$pdo->query("select count(*) from public.referrals")->fetchColumn();
+      $refVerified = (int)$pdo->query("select count(*) from public.referrals r join public.users u on u.tg_id=r.referred_id where u.verified=true")->fetchColumn();
+
+      $txt = "📊 <b>Referral Stats</b>\n\n".
+        "Users: <b>{$total}</b>\n".
+        "Verified Users: <b>{$verified}</b>\n".
+        "Total Referrals: <b>{$refTotal}</b>\n".
+        "Verified Referrals: <b>{$refVerified}</b>";
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
       exit;
     }
 
-    if (strpos($data, "admin:addtype:") === 0) {
-      $ctype = explode(":", $data)[2];
-      set_admin_state($chat_id, "await_add_codes", ["ctype"=>$ctype]);
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"➕ Send coupon codes for <b>{$ctype}</b> (1 per line).", "parse_mode"=>"HTML"]);
+    if ($data === "admin_export") {
+      $pdo = db();
+      $tmp = sys_get_temp_dir()."/export_".time().".csv";
+      $fp = fopen($tmp, "w");
+      fputcsv($fp, ["tg_id","username","first_name","points","refs","verified","banned","created_at","last_seen"]);
+      $st = $pdo->query("select tg_id, username, first_name, points, refs, verified, banned, created_at, last_seen from public.users order by tg_id asc");
+      while ($r = $st->fetch(PDO::FETCH_ASSOC)) fputcsv($fp, $r);
+      fclose($fp);
+
+      tg_send_document($chat_id, $tmp, "📤 Export users.csv");
+      @unlink($tmp);
       exit;
     }
 
-    if (strpos($data, "admin:removetype:") === 0) {
-      $ctype = explode(":", $data)[2];
-      set_admin_state($chat_id, "await_remove_codes", ["ctype"=>$ctype]);
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"➖ Send coupon codes to REMOVE for <b>{$ctype}</b> (1 per line).", "parse_mode"=>"HTML"]);
+    if ($data === "admin_import") {
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📥 Import: (placeholder)\nIf you want real import via file upload, tell me format (CSV?) and I’ll add it.", "reply_markup"=>back_admin_btn()]);
       exit;
     }
 
-    if (strpos($data, "admin:setcosttype:") === 0) {
-      $ctype = explode(":", $data)[2];
-      set_admin_state($chat_id, "await_set_cost_value", ["ctype"=>$ctype]);
-      $current = redeem_cost($ctype);
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"⚙️ Current cost for {$ctype} is {$current} points.\nSend new points number (example: 3)."]);
+    if ($data === "admin_view_requests") {
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📝 Point Requests: (placeholder)\nIf you want point request system, I can add a table + user button.", "reply_markup"=>back_admin_btn()]);
+      exit;
+    }
+
+    if ($data === "admin_bot_status") {
+      // quick status
+      $pdo = db();
+      $users = (int)$pdo->query("select count(*) from public.users")->fetchColumn();
+      $coupons = (int)$pdo->query("select count(*) from public.coupons")->fetchColumn();
+      $w = (int)$pdo->query("select count(*) from public.withdrawals")->fetchColumn();
+      $txt = "🤖 <b>Bot Status</b>\n\n".
+        "DB: <b>OK</b>\n".
+        "Users: <b>{$users}</b>\n".
+        "Coupons total: <b>{$coupons}</b>\n".
+        "Withdrawals: <b>{$w}</b>\n";
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML", "reply_markup"=>back_admin_btn()]);
       exit;
     }
   }
@@ -495,11 +755,18 @@ $text = trim($msg["text"] ?? "");
 $username = $msg["from"]["username"] ?? "";
 $first_name = $msg["from"]["first_name"] ?? "";
 
-$user = ensure_user($chat_id, $username, $first_name);
+ensure_user($chat_id, $username, $first_name);
+
+if (is_banned($chat_id) && !is_admin($chat_id)) {
+  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🚫 You are banned."]);
+  echo "OK"; exit;
+}
 
 // /start referral
 if (strpos($text, "/start") === 0) {
   $parts = explode(" ", $text);
+
+  // referral param: /start <refid>
   if (count($parts) > 1 && ctype_digit($parts[1])) {
     $ref_id = (int)$parts[1];
     if ($ref_id !== $chat_id) {
@@ -511,14 +778,18 @@ if (strpos($text, "/start") === 0) {
         $cur = $st->fetchColumn();
 
         if (!$cur) {
-          $pdo->prepare("update public.users set referrer_id=:rid where tg_id=:id")
-              ->execute([":rid"=>$ref_id, ":id"=>$chat_id]);
+          $pdo->prepare("update public.users set referrer_id=:rid where tg_id=:id")->execute([":rid"=>$ref_id, ":id"=>$chat_id]);
 
-          ensure_user($ref_id);
-          $pdo->prepare("update public.users set points=points+1, refs=refs+1 where tg_id=:rid")
-              ->execute([":rid"=>$ref_id]);
+          // log referral
+          $pdo->prepare("insert into public.referrals (referrer_id, referred_id) values (:r,:u) on conflict do nothing")
+              ->execute([":r"=>$ref_id, ":u"=>$chat_id]);
 
-          tg("sendMessage", ["chat_id"=>$ref_id, "text"=>"✅ New referral joined!\n+1 point added."]);
+          // add points to referrer
+          $reward = ref_reward();
+          $pdo->prepare("update public.users set points=points+:p, refs=refs+1 where tg_id=:rid")
+              ->execute([":p"=>$reward, ":rid"=>$ref_id]);
+
+          tg("sendMessage", ["chat_id"=>$ref_id, "text"=>"✅ New referral joined!\n+{$reward} point added."]);
         }
         $pdo->commit();
       } catch (Exception $e) {
@@ -531,7 +802,7 @@ if (strpos($text, "/start") === 0) {
   echo "OK"; exit;
 }
 
-// Admin state handling (fast)
+// Admin state handling
 if (is_admin($chat_id)) {
   $st = get_admin_state($chat_id);
   if ($st) {
@@ -558,35 +829,72 @@ if (is_admin($chat_id)) {
       }
 
       clear_admin_state($chat_id);
-
       $s = stock_all();
+
       tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Added <b>{$added}</b> coupons to {$ctype}.\n📦 New Stock: <b>{$s[$ctype]}</b>", "parse_mode"=>"HTML"]);
 
+      // notify users (as you wanted)
       broadcast_all("📢 <b>New Coupon Added!</b>\n\n✅ {$ctype} off {$ctype} coupons are now available.\n📦 Stock: <b>{$s[$ctype]}</b>");
       echo "OK"; exit;
     }
 
-    if ($mode === "await_remove_codes") {
+    if ($mode === "await_set_cost_value") {
       $ctype = $data["ctype"] ?? "";
-      $lines = preg_split("/\r\n|\n|\r/", $text);
-      $codes = [];
-      foreach ($lines as $l) { $l = trim($l); if ($l !== "") $codes[] = $l; }
-
-      if (!$ctype || count($codes) === 0) {
-        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send codes to remove (1 per line)."]);
+      if (!$ctype || !ctype_digit($text)) {
+        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send only number (example: 3)."]);
         echo "OK"; exit;
       }
+      $cfg = get_config();
+      $cfg["redeem_cost"][$ctype] = (int)$text;
+      save_config($cfg);
+      clear_admin_state($chat_id);
 
-      $removed = 0;
-      foreach ($codes as $code) {
-        $del = $pdo->prepare("delete from public.coupons where ctype=:t and code=:c and is_used=false");
-        $del->execute([":t"=>$ctype, ":c"=>$code]);
-        $removed += (int)$del->rowCount();
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Rate updated: {$ctype} => {$text} points"]);
+      echo "OK"; exit;
+    }
+
+    if ($mode === "await_add_points_user") {
+      $parts = preg_split('/\s+/', trim($text));
+      if (count($parts) < 2 || !ctype_digit($parts[0]) || !ctype_digit($parts[1])) {
+        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Format: USER_ID POINTS\nExample: 123456789 5"]);
+        echo "OK"; exit;
       }
+      $uid = (int)$parts[0];
+      $pts = (int)$parts[1];
+
+      $pdo->prepare("insert into public.users (tg_id) values (:id) on conflict (tg_id) do nothing")->execute([":id"=>$uid]);
+      $pdo->prepare("update public.users set points=points+:p where tg_id=:id")->execute([":p"=>$pts, ":id"=>$uid]);
 
       clear_admin_state($chat_id);
-      $s = stock_all();
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Removed <b>{$removed}</b> unused coupons from {$ctype}.\n📦 Stock: <b>{$s[$ctype]}</b>", "parse_mode"=>"HTML"]);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Added {$pts} points to {$uid}"]);
+      tg("sendMessage", ["chat_id"=>$uid, "text"=>"🎁 Admin added <b>{$pts}</b> points to your account.", "parse_mode"=>"HTML"]);
+      echo "OK"; exit;
+    }
+
+    if ($mode === "await_add_points_all") {
+      if (!ctype_digit($text)) {
+        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send only number. Example: 1"]);
+        echo "OK"; exit;
+      }
+      $pts = (int)$text;
+      $pdo->prepare("update public.users set points=points+:p")->execute([":p"=>$pts]);
+
+      clear_admin_state($chat_id);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Added {$pts} points to ALL users"]);
+      broadcast_all("🎁 <b>Bonus!</b>\nAdmin added <b>{$pts}</b> points to everyone.");
+      echo "OK"; exit;
+    }
+
+    if ($mode === "await_set_ref_reward") {
+      if (!ctype_digit($text)) {
+        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send only number. Example: 1"]);
+        echo "OK"; exit;
+      }
+      $cfg = get_config();
+      $cfg["ref_reward"] = (int)$text;
+      save_config($cfg);
+      clear_admin_state($chat_id);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Referral reward updated to {$text}"]);
       echo "OK"; exit;
     }
 
@@ -602,25 +910,70 @@ if (is_admin($chat_id)) {
       echo "OK"; exit;
     }
 
-    if ($mode === "await_set_cost_value") {
-      $ctype = $data["ctype"] ?? "";
-      if (!$ctype || !ctype_digit($text)) {
-        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send only number (example: 3)."]);
+    if ($mode === "await_set_daily_limit") {
+      if (!ctype_digit($text)) {
+        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send only number. Example: 5"]);
         echo "OK"; exit;
       }
       $cfg = get_config();
-      if (!isset($cfg["redeem_cost"])) $cfg["redeem_cost"] = [];
-      $cfg["redeem_cost"][$ctype] = (int)$text;
+      $cfg["daily_limit"] = (int)$text;
       save_config($cfg);
       clear_admin_state($chat_id);
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Daily limit updated to {$text}"]);
+      echo "OK"; exit;
+    }
 
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Redeem cost updated: {$ctype} => {$text} points"]);
+    if ($mode === "await_user_info") {
+      if (!ctype_digit($text)) { tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send user id only."]); echo "OK"; exit; }
+      $uid = (int)$text;
+      $u = get_user($uid);
+      clear_admin_state($chat_id);
+      if (!$u) { tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"User not found."]); echo "OK"; exit; }
+      $txt = "📄 <b>User Info</b>\n\n".
+        "ID: <b>{$u["tg_id"]}</b>\n".
+        "Username: @".($u["username"] ?: "NA")."\n".
+        "Name: ".($u["first_name"] ?: "NA")."\n".
+        "Points: <b>".((int)$u["points"])."</b>\n".
+        "Refs: <b>".((int)$u["refs"])."</b>\n".
+        "Verified: <b>".(($u["verified"])? "✅":"❌")."</b>\n".
+        "Banned: <b>".(($u["banned"])? "✅":"❌")."</b>\n";
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML"]);
+      echo "OK"; exit;
+    }
+
+    if ($mode === "await_view_refs") {
+      if (!ctype_digit($text)) { tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send user id only."]); echo "OK"; exit; }
+      $uid = (int)$text;
+      $st2 = $pdo->prepare("select referred_id, created_at from public.referrals where referrer_id=:id order by created_at desc limit 100");
+      $st2->execute([":id"=>$uid]);
+      $rows = $st2->fetchAll(PDO::FETCH_ASSOC);
+      clear_admin_state($chat_id);
+      if (!$rows) { tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"No referrals for {$uid}."]); echo "OK"; exit; }
+      $txt = "📈 <b>Referrals for {$uid}</b>\n\n";
+      foreach ($rows as $r) {
+        $txt .= $r["referred_id"]." | ".$r["created_at"]."\n";
+        if (strlen($txt) > 3500) { $txt .= "\n... truncated"; break; }
+      }
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$txt, "parse_mode"=>"HTML"]);
+      echo "OK"; exit;
+    }
+
+    if ($mode === "await_ban" || $mode === "await_unban") {
+      if (!ctype_digit($text)) { tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Send user id only."]); echo "OK"; exit; }
+      $uid = (int)$text;
+      $ban = ($mode === "await_ban");
+      $pdo->prepare("insert into public.users (tg_id) values (:id) on conflict (tg_id) do nothing")->execute([":id"=>$uid]);
+      $pdo->prepare("update public.users set banned=:b where tg_id=:id")->execute([":b"=>$ban, ":id"=>$uid]);
+      clear_admin_state($chat_id);
+
+      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ ".($ban ? "Banned" : "Unbanned")." {$uid}"]);
+      tg("sendMessage", ["chat_id"=>$uid, "text"=> $ban ? "🚫 You have been banned by admin." : "✅ You have been unbanned by admin."]);
       echo "OK"; exit;
     }
   }
 }
 
-// ✅ Verify (only not-verified users will have this button)
+// ✅ Verify button (reply keyboard) only for not-verified users
 if ($text === "✅ Verify") {
   $not = check_joined_all($chat_id);
   if (count($not) > 0) {
@@ -667,7 +1020,16 @@ if ($verified && $text === "🎟️ Coupons") {
 }
 
 if ($verified && $text === "🛠 Admin Panel" && is_admin($chat_id)) {
-  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🛠 <b>Admin Panel</b>", "parse_mode"=>"HTML", "reply_markup"=>admin_panel_buttons()]);
+  $text2 =
+    "🛠 <b>Admin Menu</b>\n\n".
+    "₹500 Rate: <b>".redeem_cost("500")."</b> pts\n".
+    "₹1000 Rate: <b>".redeem_cost("1000")."</b> pts\n".
+    "₹2000 Rate: <b>".redeem_cost("2000")."</b> pts\n".
+    "₹4000 Rate: <b>".redeem_cost("4000")."</b> pts\n".
+    "Referral Reward: <b>".ref_reward()."</b> pt\n".
+    "Withdraw: <b>".(withdraw_on() ? "ON" : "OFF")."</b>\n".
+    "Daily Limit: <b>".daily_limit()."</b>\n";
+  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$text2, "parse_mode"=>"HTML", "reply_markup"=>admin_panel_buttons()]);
   echo "OK"; exit;
 }
 
