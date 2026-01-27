@@ -1,9 +1,13 @@
 <?php
 $VERIFY_SECRET = getenv("VERIFY_SECRET");
-if (!$VERIFY_SECRET) {
+$BOT_USERNAME  = ltrim(getenv("BOT_USERNAME"), "@");
+$BOT_TOKEN     = getenv("BOT_TOKEN");
+
+header("Content-Type: application/json; charset=utf-8");
+
+if (!$VERIFY_SECRET || !$BOT_USERNAME) {
   http_response_code(500);
-  header("Content-Type: application/json");
-  echo json_encode(["ok"=>false,"message"=>"Missing VERIFY_SECRET"]);
+  echo json_encode(["ok"=>false,"error"=>"Server config missing"]);
   exit;
 }
 
@@ -30,7 +34,6 @@ function db() {
   $name = getenv("DB_NAME") ?: "postgres";
   $user = getenv("DB_USER");
   $pass = getenv("DB_PASS");
-  if (!$host || !$user || !$pass) throw new Exception("DB env missing");
   $pdo = new PDO("pgsql:host=$host;port=$port;dbname=$name", $user, $pass, [
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
   ]);
@@ -38,82 +41,69 @@ function db() {
 }
 
 function hmac_sig($tg_id) {
-  global $VERIFY_SECRET;
-  return hash_hmac("sha256", (string)$tg_id, $VERIFY_SECRET);
+  return hash_hmac("sha256", (string)$tg_id, getenv("VERIFY_SECRET"));
 }
-function sig_ok($tg_id, $sig) {
-  return hash_equals(hmac_sig($tg_id), (string)$sig);
-}
-
-function ensure_user($tg_id) {
-  $pdo = db();
-  $st = $pdo->prepare("
-    insert into public.users (tg_id)
-    values (:tg_id)
-    on conflict (tg_id) do update set last_seen=now()
-  ");
-  $st->execute([":tg_id"=>$tg_id]);
-}
-
-header("Content-Type: application/json");
 
 $raw = file_get_contents("php://input");
-$p = json_decode($raw, true) ?: [];
+$body = json_decode($raw, true);
+$tg_id = (int)($body["tg_id"] ?? 0);
+$sig   = (string)($body["sig"] ?? "");
 
-$tg_id = $p["tg_id"] ?? "";
-$sig = $p["sig"] ?? "";
-$device_id = trim((string)($p["device_id"] ?? ""));
-
-if (!ctype_digit((string)$tg_id) || $device_id === "" || !sig_ok((int)$tg_id, $sig)) {
-  http_response_code(400);
-  echo json_encode(["ok"=>false,"message"=>"Bad request"]);
+if ($tg_id <= 0 || $sig === "") {
+  echo json_encode(["ok"=>false,"error"=>"Bad request"]);
   exit;
 }
 
-$tg_id_int = (int)$tg_id;
+if (!hash_equals(hmac_sig($tg_id), $sig)) {
+  echo json_encode(["ok"=>false,"error"=>"Invalid signature"]);
+  exit;
+}
 
+// Device token (cookie) => one device only one tg id
+$cookieName = "device_token";
+$device_token = $_COOKIE[$cookieName] ?? "";
+
+if ($device_token === "" || strlen($device_token) < 20) {
+  $device_token = bin2hex(random_bytes(24));
+  setcookie($cookieName, $device_token, time()+3600*24*365, "/", "", true, true);
+}
+
+$pdo = db();
+$pdo->beginTransaction();
 try {
-  ensure_user($tg_id_int);
-  $pdo = db();
-  $pdo->beginTransaction();
+  // Ensure user exists
+  $pdo->prepare("insert into public.users (tg_id) values (:id) on conflict (tg_id) do nothing")
+      ->execute([":id"=>$tg_id]);
 
-  // 1) device -> tg check
-  $st = $pdo->prepare("select tg_id from public.device_map where device_id=:d");
-  $st->execute([":d"=>$device_id]);
-  $existing = $st->fetchColumn();
-  if ($existing && (int)$existing !== $tg_id_int) {
+  // Check if this device token already bound to another user
+  $st = $pdo->prepare("select tg_id from public.users where device_token = :dt limit 1");
+  $st->execute([":dt"=>$device_token]);
+  $bound = $st->fetchColumn();
+
+  if ($bound && (int)$bound !== $tg_id) {
     $pdo->rollBack();
-    http_response_code(403);
-    echo json_encode(["ok"=>false,"message"=>"❌ This device is already linked with another Telegram account."]);
+    echo json_encode(["ok"=>false,"error"=>"This device is already verified with another Telegram ID"]);
     exit;
   }
 
-  // 2) tg -> device check (1 TG only 1 device)
-  $st2 = $pdo->prepare("select device_id from public.device_map where tg_id=:id");
-  $st2->execute([":id"=>$tg_id_int]);
-  $existingDev = $st2->fetchColumn();
-  if ($existingDev && $existingDev !== $device_id) {
+  // Check if this user already has a different device token
+  $st2 = $pdo->prepare("select device_token from public.users where tg_id=:id for update");
+  $st2->execute([":id"=>$tg_id]);
+  $existing = $st2->fetchColumn();
+
+  if ($existing && $existing !== $device_token) {
     $pdo->rollBack();
-    http_response_code(403);
-    echo json_encode(["ok"=>false,"message"=>"❌ This Telegram account is already verified on another device."]);
+    echo json_encode(["ok"=>false,"error"=>"This Telegram ID is already verified on another device"]);
     exit;
   }
 
-  // upsert device map
-  $ins = $pdo->prepare("
-    insert into public.device_map (device_id, tg_id) values (:d,:id)
-    on conflict (device_id) do update set tg_id = excluded.tg_id
-  ");
-  $ins->execute([":d"=>$device_id, ":id"=>$tg_id_int]);
-
-  // mark verified
-  $up = $pdo->prepare("update public.users set verified=true, last_seen=now() where tg_id=:id");
-  $up->execute([":id"=>$tg_id_int]);
+  // Save verification
+  $pdo->prepare("update public.users set verified=true, device_token=:dt, verified_at=now() where tg_id=:id")
+      ->execute([":dt"=>$device_token, ":id"=>$tg_id]);
 
   $pdo->commit();
-  echo json_encode(["ok"=>true,"message"=>"✅ Verified. Now go back to Telegram and tap “Check Verification”."]);
+  echo json_encode(["ok"=>true, "bot_url"=>"https://t.me/".$BOT_USERNAME]);
 } catch (Exception $e) {
-  if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
-  http_response_code(500);
-  echo json_encode(["ok"=>false,"message"=>"Server error"]);
+  if ($pdo->inTransaction()) $pdo->rollBack();
+  echo json_encode(["ok"=>false,"error"=>"Server error"]);
 }
