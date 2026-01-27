@@ -1,10 +1,11 @@
 <?php
 // =====================================================
-// Single-file Telegram Bot + Web Verify + Supabase (PG)
+// index.php  (Telegram Webhook Bot)
+// Works with: verify.php + verify_api.php (separate files)
 // FLOW:
 // /start -> Join channels msg + ✅ Verify (only)
-// ✅ Verify -> checks join -> if ok sends web verify buttons
-// ✅ Check Verification -> if verified => show full menu (no verify button)
+// ✅ Verify -> checks join -> sends web verify buttons (verify.php)
+// ✅ Check Verification -> if verified => show full menu (NO verify button)
 // =====================================================
 
 // ---------- ENV ----------
@@ -99,10 +100,6 @@ function is_admin($tg_id) {
 function hmac_sig($tg_id) {
   global $VERIFY_SECRET;
   return hash_hmac("sha256", (string)$tg_id, $VERIFY_SECRET);
-}
-
-function sig_ok($tg_id, $sig) {
-  return hash_equals(hmac_sig($tg_id), (string)$sig);
 }
 
 // ---------- Users ----------
@@ -282,7 +279,7 @@ function send_join_message($chat_id) {
 /**
  * MAIN MENU:
  * - If verified: show coupons/stats/ref link (+ admin panel)
- * - If NOT verified: do NOT show full menu, show only ✅ Verify
+ * - If NOT verified: show only join + ✅ Verify
  */
 function send_menu($chat_id) {
   $u = get_user($chat_id);
@@ -310,10 +307,11 @@ function send_menu($chat_id) {
   ]);
 }
 
+// Inline: web verify buttons (go to verify.php)
 function verify_buttons($tg_id) {
   global $BASE_URL;
   $sig = hmac_sig($tg_id);
-  $url = $BASE_URL . "/verify?tg_id={$tg_id}&sig={$sig}";
+  $url = $BASE_URL . "/verify.php?tg_id={$tg_id}&sig={$sig}";
   return [
     "inline_keyboard" => [
       [["text"=>"✅ Verify Now", "url"=>$url]],
@@ -357,154 +355,14 @@ function admin_type_buttons() {
   ];
 }
 
-// ---------- ROUTES ----------
+// ---------- (Optional) Health check ----------
 $path = parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH);
-
-// WEB: home
 if ($path === "/" && $_SERVER["REQUEST_METHOD"] === "GET") {
   echo "OK";
   exit;
 }
 
-// WEB: verify page
-if ($path === "/verify" && $_SERVER["REQUEST_METHOD"] === "GET") {
-  $tg_id = $_GET["tg_id"] ?? "";
-  $sig   = $_GET["sig"] ?? "";
-  if (!ctype_digit($tg_id) || !sig_ok((int)$tg_id, $sig)) {
-    http_response_code(403);
-    echo "Invalid verify link";
-    exit;
-  }
-
-  $tg_safe = htmlspecialchars($tg_id, ENT_QUOTES);
-  $sig_safe = htmlspecialchars($sig, ENT_QUOTES);
-  $base = htmlspecialchars($GLOBALS["BASE_URL"], ENT_QUOTES);
-  $botu = htmlspecialchars($GLOBALS["BOT_USERNAME"], ENT_QUOTES);
-
-  header("Content-Type: text/html; charset=utf-8");
-  echo <<<HTML
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Verify</title>
-<style>
-body{font-family:Arial;background:#0b1220;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.card{width:min(520px,92vw);background:#131c2f;border-radius:16px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.4)}
-button{width:100%;padding:14px;border:0;border-radius:12px;background:#22c55e;color:#04120a;font-weight:700;font-size:16px}
-.muted{opacity:.85;font-size:13px;line-height:1.4}
-.box{background:#0f172a;border:1px solid rgba(255,255,255,.1);padding:10px;border-radius:12px;margin:12px 0}
-</style>
-</head>
-<body>
-<div class="card">
-  <h2>✅ Verify Your Device</h2>
-  <div class="box muted">1 device can verify only 1 Telegram account.</div>
-  <button onclick="doVerify()">✅ Verify Now</button>
-  <p id="msg" class="muted"></p>
-</div>
-
-<script>
-function getDeviceId(){
-  let id = localStorage.getItem("device_id");
-  if(!id){
-    id = "dev_" + Math.random().toString(16).slice(2) + "_" + Date.now();
-    localStorage.setItem("device_id", id);
-  }
-  return id;
-}
-async function doVerify(){
-  const device_id = getDeviceId();
-  document.getElementById("msg").innerText = "Verifying...";
-  const res = await fetch("{$base}/api/verify", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({tg_id:"{$tg_safe}", sig:"{$sig_safe}", device_id})
-  });
-  const data = await res.json();
-  document.getElementById("msg").innerText = data.message || "Done";
-  if(data.ok){
-    setTimeout(()=>{ window.location.href="https://t.me/{$botu}"; }, 900);
-  }
-}
-</script>
-</body>
-</html>
-HTML;
-  exit;
-}
-
-// WEB: verify API
-if ($path === "/api/verify" && $_SERVER["REQUEST_METHOD"] === "POST") {
-  $raw = file_get_contents("php://input");
-  $p = json_decode($raw, true) ?: [];
-
-  $tg_id = $p["tg_id"] ?? "";
-  $sig = $p["sig"] ?? "";
-  $device_id = trim((string)($p["device_id"] ?? ""));
-
-  header("Content-Type: application/json");
-  if (!ctype_digit((string)$tg_id) || $device_id === "" || !sig_ok((int)$tg_id, $sig)) {
-    http_response_code(400);
-    echo json_encode(["ok"=>false,"message"=>"Bad request"]);
-    exit;
-  }
-
-  $tg_id_int = (int)$tg_id;
-  ensure_user($tg_id_int);
-
-  $pdo = db();
-  try {
-    $pdo->beginTransaction();
-
-    // device already linked to another tg_id -> reject
-    $st = $pdo->prepare("select tg_id from public.device_map where device_id=:d");
-    $st->execute([":d"=>$device_id]);
-    $existing = $st->fetchColumn();
-    if ($existing && (int)$existing !== $tg_id_int) {
-      $pdo->rollBack();
-      http_response_code(403);
-      echo json_encode(["ok"=>false,"message"=>"❌ This device is already linked with another Telegram account."]);
-      exit;
-    }
-
-    // also enforce 1 tg_id -> 1 device (unique tg_id in device_map)
-    // if tg already has a device, allow re-verify only if same device? we keep strict:
-    $st2 = $pdo->prepare("select device_id from public.device_map where tg_id=:id");
-    $st2->execute([":id"=>$tg_id_int]);
-    $existingDeviceForUser = $st2->fetchColumn();
-    if ($existingDeviceForUser && $existingDeviceForUser !== $device_id) {
-      $pdo->rollBack();
-      http_response_code(403);
-      echo json_encode(["ok"=>false,"message"=>"❌ This Telegram account is already verified on another device."]);
-      exit;
-    }
-
-    // upsert device map
-    $ins = $pdo->prepare("
-      insert into public.device_map (device_id, tg_id) values (:d,:id)
-      on conflict (device_id) do update set tg_id = excluded.tg_id
-    ");
-    $ins->execute([":d"=>$device_id, ":id"=>$tg_id_int]);
-
-    // mark verified
-    $up = $pdo->prepare("update public.users set verified=true, last_seen=now() where tg_id=:id");
-    $up->execute([":id"=>$tg_id_int]);
-
-    $pdo->commit();
-    echo json_encode(["ok"=>true,"message"=>"✅ Verified. Now go back to Telegram and tap “Check Verification”."]);
-    exit;
-
-  } catch (Exception $e) {
-    if ($pdo->inTransaction()) $pdo->rollBack();
-    http_response_code(500);
-    echo json_encode(["ok"=>false,"message"=>"Server error"]);
-    exit;
-  }
-}
-
-// TELEGRAM WEBHOOK
+// ---------- TELEGRAM WEBHOOK ----------
 $update = json_decode(file_get_contents("php://input"), true);
 if (!$update) { echo "OK"; exit; }
 
@@ -530,7 +388,6 @@ if (isset($update["callback_query"])) {
     ]);
 
     if ($ok) {
-      // show menu without verify button
       send_menu($chat_id);
     }
     exit;
@@ -542,13 +399,11 @@ if (isset($update["callback_query"])) {
 
     $res = redeem_coupon($chat_id, $ctype);
     if (!$res["ok"]) {
-      $msg = $res["msg"];
-      // stock out => no deduction
-      if ($msg === "Stock out") {
+      if ($res["msg"] === "Stock out") {
         tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"], "text"=>"Stock out", "show_alert"=>true]);
         tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ <b>{$ctype} off {$ctype}</b> coupon stock out.\nYour points were not deducted.", "parse_mode"=>"HTML"]);
       } else {
-        tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"], "text"=>$msg, "show_alert"=>true]);
+        tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"], "text"=>$res["msg"], "show_alert"=>true]);
       }
       exit;
     }
@@ -649,7 +504,7 @@ if (strpos($text, "/start") === 0) {
     }
   }
 
-  // ✅ ALWAYS show join + verify first
+  // Always show join + verify first
   send_join_message($chat_id);
   echo "OK"; exit;
 }
@@ -686,14 +541,14 @@ if (is_admin($chat_id)) {
     $stock = coupon_stock($ctype);
     tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Added <b>{$added}</b> coupons to {$ctype}.\n📦 New Stock: <b>{$stock}</b>", "parse_mode"=>"HTML"]);
 
-    // ✅ broadcast
+    // broadcast to all
     broadcast_all("📢 <b>New Coupon Added!</b>\n\n✅ {$ctype} off {$ctype} coupons are now available.\n📦 Stock: <b>{$stock}</b>");
 
     echo "OK"; exit;
   }
 }
 
-// ✅ Verify button in chat (reply keyboard)
+// ✅ Verify button (reply keyboard)
 if ($text === "✅ Verify") {
   $not = check_joined_all($chat_id);
   if (count($not) > 0) {
@@ -703,7 +558,7 @@ if ($text === "✅ Verify") {
     echo "OK"; exit;
   }
 
-  // joined -> send web verify buttons
+  // joined -> send web verify buttons (verify.php)
   tg("sendMessage", [
     "chat_id"=>$chat_id,
     "text"=>"✅ Joined all required channels.\n\nNow verify your device:",
@@ -712,7 +567,7 @@ if ($text === "✅ Verify") {
   echo "OK"; exit;
 }
 
-// If verified, allow menu actions
+// Verified-only menu actions
 $u = get_user($chat_id);
 $verified = ($u && ($u["verified"] ?? false));
 
@@ -745,6 +600,6 @@ if ($verified && $text === "🛠 Admin Panel" && is_admin($chat_id)) {
   echo "OK"; exit;
 }
 
-// Default: show correct menu depending on verified
+// Default: show correct menu
 send_menu($chat_id);
 echo "OK";
