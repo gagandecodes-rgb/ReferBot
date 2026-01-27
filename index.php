@@ -1,11 +1,21 @@
 <?php
 // =====================================================
-// index.php  (Telegram Webhook Bot)
-// Works with: verify.php + verify_api.php (separate files)
+// index.php (Telegram Webhook Bot) + Supabase (Postgres)
+// Uses separate files: verify.php + verify_api.php
+//
 // FLOW:
 // /start -> Join channels msg + ✅ Verify (only)
 // ✅ Verify -> checks join -> sends web verify buttons (verify.php)
 // ✅ Check Verification -> if verified => show full menu (NO verify button)
+//
+// ADMIN PANEL (ALL BUTTONS):
+// - Add Coupons (type -> send codes)
+// - Remove Coupons (type -> send codes to remove)
+// - Stock
+// - Withdrawals Log
+// - Users Stats
+// - Broadcast
+// - Set Redeem Cost (points)
 // =====================================================
 
 // ---------- ENV ----------
@@ -36,12 +46,12 @@ foreach (explode(",", $FORCE_JOIN_RAW) as $c) {
   if ($c !== "") $CHANNELS_REQUIRED[] = $c;
 }
 if (count($CHANNELS_REQUIRED) === 0) {
-  // fallback
+  // fallback (change in env)
   $CHANNELS_REQUIRED = ["@channel1","@channel2","@channel3","@channel4"];
 }
 
-// Points cost
-$REDEEM_COST = ["500"=>3, "1000"=>10, "2000"=>20, "4000"=>40];
+// Default points costs (admin can change from panel)
+$DEFAULT_REDEEM_COST = ["500"=>3, "1000"=>10, "2000"=>20, "4000"=>40];
 $REF_REWARD = 1;
 
 // ---------- DB (Supabase Postgres) ----------
@@ -85,7 +95,7 @@ function tg($method, $data) {
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_HTTPHEADER => ["Content-Type: application/json"],
     CURLOPT_POSTFIELDS => json_encode($data),
-    CURLOPT_TIMEOUT => 20
+    CURLOPT_TIMEOUT => 25
   ]);
   $res = curl_exec($ch);
   curl_close($ch);
@@ -100,6 +110,50 @@ function is_admin($tg_id) {
 function hmac_sig($tg_id) {
   global $VERIFY_SECRET;
   return hash_hmac("sha256", (string)$tg_id, $VERIFY_SECRET);
+}
+
+// ---------- Admin state (file) ----------
+$STATE_FILE = __DIR__ . "/state.json";
+
+function state_load() {
+  global $STATE_FILE;
+  if (!file_exists($STATE_FILE)) return [];
+  $j = json_decode(file_get_contents($STATE_FILE), true);
+  return is_array($j) ? $j : [];
+}
+function state_save($s) {
+  global $STATE_FILE;
+  file_put_contents($STATE_FILE, json_encode($s, JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE));
+}
+function set_admin_state($admin_id, $mode, $data=[]) {
+  $s = state_load();
+  $s[(string)$admin_id] = ["mode"=>$mode, "data"=>$data, "ts"=>time()];
+  state_save($s);
+}
+function get_admin_state($admin_id) {
+  $s = state_load();
+  return $s[(string)$admin_id] ?? null;
+}
+function clear_admin_state($admin_id) {
+  $s = state_load();
+  unset($s[(string)$admin_id]);
+  state_save($s);
+}
+function get_config() {
+  $s = state_load();
+  return $s["_config"] ?? ["redeem_cost" => []];
+}
+function save_config($cfg) {
+  $s = state_load();
+  $s["_config"] = $cfg;
+  state_save($s);
+}
+function redeem_cost($ctype) {
+  global $DEFAULT_REDEEM_COST;
+  $cfg = get_config();
+  $rc = $cfg["redeem_cost"] ?? [];
+  if (isset($rc[$ctype]) && is_numeric($rc[$ctype])) return (int)$rc[$ctype];
+  return (int)($DEFAULT_REDEEM_COST[$ctype] ?? 999999);
 }
 
 // ---------- Users ----------
@@ -155,8 +209,7 @@ function coupon_stock($ctype) {
  * - if stock out => NO point cut
  */
 function redeem_coupon($tg_id, $ctype) {
-  global $REDEEM_COST;
-  $cost = $REDEEM_COST[$ctype] ?? 999999;
+  $cost = redeem_cost($ctype);
 
   $pdo = db();
   $pdo->beginTransaction();
@@ -203,7 +256,7 @@ function redeem_coupon($tg_id, $ctype) {
     $use = $pdo->prepare("update public.coupons set is_used=true, used_by=:id, used_at=now() where id=:cid");
     $use->execute([":id"=>$tg_id, ":cid"=>$coupon["id"]]);
 
-    // withdrawals log (exact code)
+    // withdrawals log
     $w = $pdo->prepare("insert into public.withdrawals (tg_id, ctype, code) values (:id,:t,:code)");
     $w->execute([":id"=>$tg_id, ":t"=>$ctype, ":code"=>$coupon["code"]]);
 
@@ -224,34 +277,6 @@ function broadcast_all($text) {
     tg("sendMessage", ["chat_id"=>$uid, "text"=>$text, "parse_mode"=>"HTML"]);
     usleep(30000);
   }
-}
-
-// ---------- Admin state (file) ----------
-$STATE_FILE = __DIR__ . "/state.json";
-
-function state_load() {
-  global $STATE_FILE;
-  if (!file_exists($STATE_FILE)) return [];
-  $j = json_decode(file_get_contents($STATE_FILE), true);
-  return is_array($j) ? $j : [];
-}
-function state_save($s) {
-  global $STATE_FILE;
-  file_put_contents($STATE_FILE, json_encode($s, JSON_PRETTY_PRINT));
-}
-function set_admin_state($admin_id, $mode, $ctype=null) {
-  $s = state_load();
-  $s[(string)$admin_id] = ["mode"=>$mode, "ctype"=>$ctype, "ts"=>time()];
-  state_save($s);
-}
-function get_admin_state($admin_id) {
-  $s = state_load();
-  return $s[(string)$admin_id] ?? null;
-}
-function clear_admin_state($admin_id) {
-  $s = state_load();
-  unset($s[(string)$admin_id]);
-  state_save($s);
 }
 
 // ---------- UI ----------
@@ -276,11 +301,6 @@ function send_join_message($chat_id) {
   ]);
 }
 
-/**
- * MAIN MENU:
- * - If verified: show coupons/stats/ref link (+ admin panel)
- * - If NOT verified: show only join + ✅ Verify
- */
 function send_menu($chat_id) {
   $u = get_user($chat_id);
   $verified = ($u && ($u["verified"] ?? false));
@@ -298,16 +318,14 @@ function send_menu($chat_id) {
     $keyboard[] = [["text"=>"🛠 Admin Panel"]];
   }
 
-  $kb = ["keyboard"=>$keyboard, "resize_keyboard"=>true];
   tg("sendMessage", [
     "chat_id"=>$chat_id,
     "text"=>"✅ <b>Verified!</b>\n\nWelcome to the bot menu 👇",
     "parse_mode"=>"HTML",
-    "reply_markup"=>$kb
+    "reply_markup"=>["keyboard"=>$keyboard, "resize_keyboard"=>true]
   ]);
 }
 
-// Inline: web verify buttons (go to verify.php)
 function verify_buttons($tg_id) {
   global $BASE_URL;
   $sig = hmac_sig($tg_id);
@@ -338,24 +356,36 @@ function coupons_buttons() {
 function admin_panel_buttons() {
   return [
     "inline_keyboard" => [
-      [["text"=>"➕ Add Coupons", "callback_data"=>"admin:add"]],
-      [["text"=>"📦 Stock", "callback_data"=>"admin:stock"]],
-      [["text"=>"📜 Withdrawals Log", "callback_data"=>"admin:logs"]],
-    ]
-  ];
-}
-function admin_type_buttons() {
-  return [
-    "inline_keyboard" => [
-      [["text"=>"500", "callback_data"=>"admin:addtype:500"]],
-      [["text"=>"1000", "callback_data"=>"admin:addtype:1000"]],
-      [["text"=>"2000", "callback_data"=>"admin:addtype:2000"]],
-      [["text"=>"4000", "callback_data"=>"admin:addtype:4000"]],
+      [
+        ["text"=>"➕ Add Coupons", "callback_data"=>"admin:add"],
+        ["text"=>"➖ Remove Coupon", "callback_data"=>"admin:remove"]
+      ],
+      [
+        ["text"=>"📦 Stock", "callback_data"=>"admin:stock"],
+        ["text"=>"📜 Withdrawals", "callback_data"=>"admin:logs"]
+      ],
+      [
+        ["text"=>"👥 Users Stats", "callback_data"=>"admin:users"],
+        ["text"=>"📣 Broadcast", "callback_data"=>"admin:broadcast"]
+      ],
+      [
+        ["text"=>"⚙️ Set Redeem Cost", "callback_data"=>"admin:setcost"]
+      ]
     ]
   ];
 }
 
-// ---------- (Optional) Health check ----------
+function type_buttons($prefix) {
+  // $prefix examples: admin:addtype:, admin:removetype:, admin:setcosttype:
+  return [
+    "inline_keyboard" => [
+      [["text"=>"500",  "callback_data"=>$prefix."500"],  ["text"=>"1000", "callback_data"=>$prefix."1000"]],
+      [["text"=>"2000", "callback_data"=>$prefix."2000"], ["text"=>"4000", "callback_data"=>$prefix."4000"]],
+    ]
+  ];
+}
+
+// ---------- Health check ----------
 $path = parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH);
 if ($path === "/" && $_SERVER["REQUEST_METHOD"] === "GET") {
   echo "OK";
@@ -376,7 +406,7 @@ if (isset($update["callback_query"])) {
 
   ensure_user($chat_id, $username, $first_name);
 
-  // ✅ Check Verification -> if verified show full menu (verify removed)
+  // Check Verification
   if ($data === "check_verify") {
     $u = get_user($chat_id);
     $ok = ($u && ($u["verified"] ?? false));
@@ -387,219 +417,9 @@ if (isset($update["callback_query"])) {
       "show_alert"=>true
     ]);
 
-    if ($ok) {
-      send_menu($chat_id);
-    }
+    if ($ok) send_menu($chat_id);
     exit;
   }
 
-  // redeem
-  if (strpos($data, "redeem:") === 0) {
-    $ctype = explode(":", $data, 2)[1];
-
-    $res = redeem_coupon($chat_id, $ctype);
-    if (!$res["ok"]) {
-      if ($res["msg"] === "Stock out") {
-        tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"], "text"=>"Stock out", "show_alert"=>true]);
-        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ <b>{$ctype} off {$ctype}</b> coupon stock out.\nYour points were not deducted.", "parse_mode"=>"HTML"]);
-      } else {
-        tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"], "text"=>$res["msg"], "show_alert"=>true]);
-      }
-      exit;
-    }
-
-    tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"], "text"=>"Success ✅", "show_alert"=>false]);
-    tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🎉 <b>Congratulations!</b>\n\nYour Coupon:\n<code>{$res["code"]}</code>", "parse_mode"=>"HTML"]);
-
-    // admin notify
-    global $ADMIN_IDS;
-    foreach ($ADMIN_IDS as $aid => $_) {
-      tg("sendMessage", ["chat_id"=>$aid, "text"=>"✅ Redeemed: {$ctype}\nUser: {$chat_id} (@".($username ?: "NA").")\nCode: {$res["code"]}"]);
-    }
-    exit;
-  }
-
-  // admin panel
-  if (is_admin($chat_id) && strpos($data, "admin:") === 0) {
-    if ($data === "admin:add") {
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"➕ Select coupon type:", "reply_markup"=>admin_type_buttons()]);
-      tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
-      exit;
-    }
-    if (strpos($data, "admin:addtype:") === 0) {
-      $ctype = explode(":", $data)[2];
-      set_admin_state($chat_id, "await_codes", $ctype);
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"Send coupon codes for <b>{$ctype}</b> (1 per line).", "parse_mode"=>"HTML"]);
-      tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
-      exit;
-    }
-    if ($data === "admin:stock") {
-      $msg = "📦 <b>Stock</b>\n\n";
-      foreach (["500","1000","2000","4000"] as $t) $msg .= "{$t}: <b>".coupon_stock($t)."</b>\n";
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msg, "parse_mode"=>"HTML"]);
-      tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
-      exit;
-    }
-    if ($data === "admin:logs") {
-      $pdo = db();
-      $st = $pdo->query("select tg_id, ctype, code, created_at from public.withdrawals order by id desc limit 10");
-      $rows = $st->fetchAll(PDO::FETCH_ASSOC);
-      if (!$rows) {
-        tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📜 No withdrawals yet."]);
-        tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
-        exit;
-      }
-      $msg = "📜 <b>Last Withdrawals</b>\n\n";
-      foreach ($rows as $r) $msg .= "• ".$r["created_at"]." | ".$r["ctype"]." | ".$r["tg_id"]."\n";
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msg, "parse_mode"=>"HTML"]);
-      tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
-      exit;
-    }
-  }
-
-  tg("answerCallbackQuery", ["callback_query_id"=>$cq["id"]]);
-  exit;
-}
-
-// ----- MESSAGES -----
-$msg = $update["message"] ?? null;
-if (!$msg) { echo "OK"; exit; }
-
-$chat_id = $msg["from"]["id"];
-$text = trim($msg["text"] ?? "");
-$username = $msg["from"]["username"] ?? "";
-$first_name = $msg["from"]["first_name"] ?? "";
-
-ensure_user($chat_id, $username, $first_name);
-
-// /start with referral
-if (strpos($text, "/start") === 0) {
-  $parts = explode(" ", $text);
-  if (count($parts) > 1 && ctype_digit($parts[1])) {
-    $ref_id = (int)$parts[1];
-    if ($ref_id !== $chat_id) {
-      $pdo = db();
-      $pdo->beginTransaction();
-      try {
-        // lock current user
-        $st = $pdo->prepare("select referrer_id from public.users where tg_id=:id for update");
-        $st->execute([":id"=>$chat_id]);
-        $cur = $st->fetchColumn();
-
-        if (!$cur) {
-          $up = $pdo->prepare("update public.users set referrer_id=:rid where tg_id=:id");
-          $up->execute([":rid"=>$ref_id, ":id"=>$chat_id]);
-
-          // reward referrer
-          ensure_user($ref_id);
-          $rw = $pdo->prepare("update public.users set points=points+1, refs=refs+1 where tg_id=:rid");
-          $rw->execute([":rid"=>$ref_id]);
-
-          tg("sendMessage", ["chat_id"=>$ref_id, "text"=>"✅ New referral joined!\n+1 point added."]);
-        }
-        $pdo->commit();
-      } catch (Exception $e) {
-        $pdo->rollBack();
-      }
-    }
-  }
-
-  // Always show join + verify first
-  send_join_message($chat_id);
-  echo "OK"; exit;
-}
-
-// Admin adding coupons (state)
-if (is_admin($chat_id)) {
-  $st = get_admin_state($chat_id);
-  if ($st && ($st["mode"] ?? "") === "await_codes") {
-    $ctype = $st["ctype"];
-
-    $lines = preg_split("/\r\n|\n|\r/", $text);
-    $codes = [];
-    foreach ($lines as $l) {
-      $l = trim($l);
-      if ($l !== "") $codes[] = $l;
-    }
-    if (count($codes) === 0) {
-      tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ No codes found. Send 1 per line."]);
-      echo "OK"; exit;
-    }
-
-    $pdo = db();
-    $added = 0;
-    foreach ($codes as $code) {
-      try {
-        $ins = $pdo->prepare("insert into public.coupons (ctype, code) values (:t,:c) on conflict (code) do nothing");
-        $ins->execute([":t"=>$ctype, ":c"=>$code]);
-        $added += ($ins->rowCount() > 0) ? 1 : 0;
-      } catch (Exception $e) {}
-    }
-
-    clear_admin_state($chat_id);
-
-    $stock = coupon_stock($ctype);
-    tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"✅ Added <b>{$added}</b> coupons to {$ctype}.\n📦 New Stock: <b>{$stock}</b>", "parse_mode"=>"HTML"]);
-
-    // broadcast to all
-    broadcast_all("📢 <b>New Coupon Added!</b>\n\n✅ {$ctype} off {$ctype} coupons are now available.\n📦 Stock: <b>{$stock}</b>");
-
-    echo "OK"; exit;
-  }
-}
-
-// ✅ Verify button (reply keyboard)
-if ($text === "✅ Verify") {
-  $not = check_joined_all($chat_id);
-  if (count($not) > 0) {
-    $msgTxt = "❌ You must join all channels first:\n\n" . implode("\n", $not) . "\n\nThen click ✅ Verify again.";
-    $kb = ["keyboard" => [[["text"=>"✅ Verify"]]], "resize_keyboard" => true];
-    tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msgTxt, "reply_markup"=>$kb]);
-    echo "OK"; exit;
-  }
-
-  // joined -> send web verify buttons (verify.php)
-  tg("sendMessage", [
-    "chat_id"=>$chat_id,
-    "text"=>"✅ Joined all required channels.\n\nNow verify your device:",
-    "reply_markup"=>verify_buttons($chat_id)
-  ]);
-  echo "OK"; exit;
-}
-
-// Verified-only menu actions
-$u = get_user($chat_id);
-$verified = ($u && ($u["verified"] ?? false));
-
-if ($verified && $text === "📊 Stats") {
-  $points = (int)($u["points"] ?? 0);
-  $refs = (int)($u["refs"] ?? 0);
-  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"📊 <b>Your Stats</b>\n\n👥 Referrals: <b>{$refs}</b>\n⭐ Points: <b>{$points}</b>\n🔒 Verified: <b>✅ Yes</b>", "parse_mode"=>"HTML"]);
-  echo "OK"; exit;
-}
-
-if ($verified && $text === "👥 Referral Link") {
-  global $BOT_USERNAME;
-  $link = "https://t.me/{$BOT_USERNAME}?start={$chat_id}";
-  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"👥 <b>Your Referral Link</b>\n{$link}", "parse_mode"=>"HTML"]);
-  echo "OK"; exit;
-}
-
-if ($verified && $text === "🎟️ Coupons") {
-  $msgTxt = "🎟️ <b>Available Coupons</b>\n\n";
-  foreach (["500","1000","2000","4000"] as $t) {
-    $msgTxt .= "{$t} off {$t}: <b>".coupon_stock($t)."</b>\n";
-  }
-  $msgTxt .= "\nTap a button to redeem:";
-  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>$msgTxt, "parse_mode"=>"HTML", "reply_markup"=>coupons_buttons()]);
-  echo "OK"; exit;
-}
-
-if ($verified && $text === "🛠 Admin Panel" && is_admin($chat_id)) {
-  tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"🛠 <b>Admin Panel</b>", "parse_mode"=>"HTML", "reply_markup"=>admin_panel_buttons()]);
-  echo "OK"; exit;
-}
-
-// Default: show correct menu
-send_menu($chat_id);
-echo "OK";
+  // Redeem
+  if (strpos($data, "rede
