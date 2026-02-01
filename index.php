@@ -416,26 +416,39 @@ function coupons_buttons() {
 }
 
 function admin_panel_buttons() {
-  // mm.py style callbacks (kept same-ish)
+  // EXACT mm.py button labels + callback_data
   return [
     "inline_keyboard"=>[
-      [["text"=>"➕ Add Coupons (₹500)", "callback_data"=>"admin_add_coupon:500"], ["text"=>"➕ Add Coupons (₹1000)", "callback_data"=>"admin_add_coupon:1000"]],
-      [["text"=>"➕ Add Coupons (₹2000)", "callback_data"=>"admin_add_coupon:2000"], ["text"=>"➕ Add Coupons (₹4000)", "callback_data"=>"admin_add_coupon:4000"]],
+      [["text"=>"Add ₹500 Codes 📦", "callback_data"=>"admin_add_bb500"]],
+      [["text"=>"Add ₹1000 Codes 📦", "callback_data"=>"admin_add_bb1000"]],
+      [["text"=>"Add ₹2000 Codes 📦", "callback_data"=>"admin_add_bb2000"]],
+      [["text"=>"Add ₹4000 Codes 📦", "callback_data"=>"admin_add_bb4000"]],
 
-      [["text"=>"💰 Set Rate (₹500)", "callback_data"=>"admin_set_rate:500"], ["text"=>"💰 Set Rate (₹1000)", "callback_data"=>"admin_set_rate:1000"]],
-      [["text"=>"💰 Set Rate (₹2000)", "callback_data"=>"admin_set_rate:2000"], ["text"=>"💰 Set Rate (₹4000)", "callback_data"=>"admin_set_rate:4000"]],
+      [["text"=>"Set ₹500 Rate ⚙️", "callback_data"=>"admin_set_redeem500"]],
+      [["text"=>"Set ₹1000 Rate ⚙️", "callback_data"=>"admin_set_redeem1000"]],
+      [["text"=>"Set ₹2000 Rate ⚙️", "callback_data"=>"admin_set_redeem2000"]],
+      [["text"=>"Set ₹4000 Rate ⚙️", "callback_data"=>"admin_set_redeem4000"]],
 
-      [["text"=>"⭐ Add Points (User)", "callback_data"=>"admin_add_points_user"], ["text"=>"🌟 Add Points (All)", "callback_data"=>"admin_add_points_all"]],
-      [["text"=>"🎉 Set Ref Reward", "callback_data"=>"admin_set_ref_reward"], ["text"=>"📣 Broadcast", "callback_data"=>"admin_broadcast"]],
-
-      [["text"=>"📦 Coupon Stats", "callback_data"=>"admin_coupon_stats"], ["text"=>"📋 User List", "callback_data"=>"admin_user_list"]],
-      [["text"=>"💎 Top Balances", "callback_data"=>"admin_top_balances"], ["text"=>"📈 View Refs", "callback_data"=>"admin_view_refs"]],
-      [["text"=>"📄 User Info", "callback_data"=>"admin_user_info"], ["text"=>"🚫 Ban", "callback_data"=>"admin_ban"]],
-      [["text"=>"🔑 Unban", "callback_data"=>"admin_unban"], ["text"=>"📣 Channels", "callback_data"=>"admin_channels"]],
-      [["text"=>"🧩 Tasks", "callback_data"=>"admin_tasks"], ["text"=>"⚙️ Withdraw Settings", "callback_data"=>"admin_withdraw_settings"]],
-      [["text"=>"📊 Referral Stats", "callback_data"=>"admin_ref_stats"], ["text"=>"📤 Export Data", "callback_data"=>"admin_export"]],
-      [["text"=>"📥 Import Data", "callback_data"=>"admin_import"], ["text"=>"📝 View Point Requests", "callback_data"=>"admin_view_requests"]],
+      [["text"=>"Add Points to User ⭐", "callback_data"=>"admin_points_user"]],
+      [["text"=>"Add Points to All ⭐", "callback_data"=>"admin_points_all"]],
+      [["text"=>"Set Referral Reward 🎁", "callback_data"=>"admin_set_ref_reward"]],
+      [["text"=>"Broadcast Message 📢", "callback_data"=>"admin_broadcast"]],
+      [["text"=>"Coupon Stats 📊", "callback_data"=>"admin_coupon_stats"]],
+      [["text"=>"User List 📋", "callback_data"=>"admin_user_list"]],
+      [["text"=>"Top Balances 💎", "callback_data"=>"admin_top_balances"]],
+      [["text"=>"View Referrals 📈", "callback_data"=>"admin_view_refs"]],
+      [["text"=>"User Full Info 📄", "callback_data"=>"admin_user_info"]],
+      [["text"=>"Ban User 🚫", "callback_data"=>"admin_ban"]],
+      [["text"=>"Unban User 🔑", "callback_data"=>"admin_unban"]],
+      [["text"=>"Channels 📺", "callback_data"=>"admin_channels"]],
+      [["text"=>"Tasks ✅", "callback_data"=>"admin_tasks"]],
+      [["text"=>"Withdraw Settings 🎁", "callback_data"=>"admin_withdraw_settings"]],
+      [["text"=>"Referral Stats 📊", "callback_data"=>"admin_ref_stats"]],
+      [["text"=>"📤 Export Data", "callback_data"=>"admin_export"]],
+      [["text"=>"📥 Import Data", "callback_data"=>"admin_import"]],
+      [["text"=>"View Point Requests 📝", "callback_data"=>"admin_view_requests"]],
       [["text"=>"🤖 Bot Status", "callback_data"=>"admin_bot_status"]],
+      [["text"=>"Back to Main 🔙", "callback_data"=>"back_main"]],
     ]
   ];
 }
@@ -479,6 +492,14 @@ if (isset($update["callback_query"])) {
     exit;
   }
 
+  // Back to main menu (used in mm.py admin panel)
+  if ($data === "back_main") {
+    $u = get_user($chat_id);
+    if ($u && ($u["verified"] ?? false)) send_menu($chat_id, $u);
+    else tg("sendMessage", ["chat_id"=>$chat_id, "text"=>"❌ Please verify first."]);
+    exit;
+  }
+
   // Redeem
   if (strpos($data, "redeem:") === 0) {
     $ctype = explode(":", $data, 2)[1];
@@ -507,6 +528,22 @@ if (isset($update["callback_query"])) {
 
   // Admin Panel callbacks
   if (is_admin($chat_id)) {
+
+    // --- mm.py callback aliases -> PHP handlers ---
+    $alias = [
+      "admin_add_bb500"      => "admin_add_coupon:500",
+      "admin_add_bb1000"     => "admin_add_coupon:1000",
+      "admin_add_bb2000"     => "admin_add_coupon:2000",
+      "admin_add_bb4000"     => "admin_add_coupon:4000",
+      "admin_set_redeem500"  => "admin_set_rate:500",
+      "admin_set_redeem1000" => "admin_set_rate:1000",
+      "admin_set_redeem2000" => "admin_set_rate:2000",
+      "admin_set_redeem4000" => "admin_set_rate:4000",
+      "admin_points_user"    => "admin_add_points_user",
+      "admin_points_all"     => "admin_add_points_all",
+    ];
+    if (isset($alias[$data])) $data = $alias[$data];
+
 
     if ($data === "admin_back") {
       $cfg = get_config();
